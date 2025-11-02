@@ -1,4 +1,4 @@
-
+import BalancesInline from '../components/BalancesInline'
 import { useEffect, useMemo, useState } from 'react'
 import AuthGate from '../components/AuthGate'
 import Nav from '../components/Nav'
