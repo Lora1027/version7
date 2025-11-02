@@ -142,10 +142,10 @@ export default function Dashboard() {
           <div className="card"><h3>Money on Hand + Bank</h3><div>{fmt(totals.currentMoney)}</div></div>
         </div>
 
-        <div className="card">
-          <h2>Filters</h2>
-          <div className="row">
-            <div style={{ gridColumn: 'span 2' }}>
+       <div className="card">
+  <h2>Cash / Bank (Inline Edit)</h2>
+  <BalancesInline onChanged={load} />
+</div>
               <label>Type</label>
               <select className="input" value={filters.type} onChange={e => setFilters({ ...filters, type: e.target.value })}>
                 <option value="all">All</option>
