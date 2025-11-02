@@ -1,3 +1,4 @@
+import BalancesInline from '../components/BalancesInline'
 import { useEffect, useMemo, useState } from 'react'
 import AuthGate from '../components/AuthGate'
 import Nav from '../components/Nav'
@@ -204,6 +205,12 @@ export default function ComparisonAll() {
           </table>
         </div>
       </div>
-    </AuthGate>
+      <div className="card">
+  <h2>Cash / Bank (Inline Edit)</h2>
+  <BalancesInline onChanged={() => window.location.reload()} />
+</div>
+
+</div>  {/* end of container */}
+</AuthGate>
   )
 }
