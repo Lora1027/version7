@@ -1,4 +1,3 @@
-
 import { useEffect, useMemo, useState } from 'react'
 import AuthGate from '../components/AuthGate'
 import Nav from '../components/Nav'
@@ -6,131 +5,203 @@ import { supabase } from '../lib/supabaseClient'
 import { fmt } from '../lib/money'
 
 type Tx = {
-  date: string
+  id: string
+  date: string        // YYYY-MM-DD
   type: 'income' | 'expense'
   category: string | null
   method: 'cash' | 'gcash' | 'bank'
   amount: number
 }
 
-function daysBetween(from?: string, to?: string) {
-  if (!from || !to) return 0
-  const a = new Date(from + 'T00:00:00')
-  const b = new Date(to + 'T00:00:00')
-  const ms = b.getTime() - a.getTime()
-  const d = Math.floor(ms / (1000 * 60 * 60 * 24)) + 1
-  return d > 0 ? d : 0
-}
-function pctDelta(a: number, b: number) {
-  if (!isFinite(b) || b === 0) return 0
-  return ((a - b) / b) * 100
-}
-function sum(ns: number[]) { return ns.reduce((x, y) => x + y, 0) }
-
-function makeKPIs(rows: Tx[], from?: string, to?: string) {
-  const revenue = sum(rows.filter(r => r.type === 'income').map(r => r.amount))
-  const cogs = sum(rows.filter(r => (r.category || '').toLowerCase() === 'cogs').map(r => r.amount))
-  const grossProfit = revenue - cogs
-  const expense = sum(rows.filter(r => r.type === 'expense').map(r => r.amount))
-  const net = revenue - expense
-  const days = Math.max(1, daysBetween(from, to))
-  const avgSales = revenue / days
-  const avgGrossProfit = grossProfit / days
-  return { revenue, cogs, grossProfit, expense, net, days, avgSales, avgGrossProfit }
+type Balance = {
+  id: string
+  label: string
+  kind: 'cash' | 'bank'
+  balance: number
+  updated_at: string
 }
 
-export default function Comparison() {
+function yyyymm(d: string) {
+  const dt = new Date(d + 'T00:00:00')
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}`
+}
+function sum(ns: number[]) { return ns.reduce((a,b)=>a+b,0) }
+function betweenDaysInclusive(minDate?: string, maxDate?: string) {
+  if (!minDate || !maxDate) return 0
+  const a = new Date(minDate + 'T00:00:00').getTime()
+  const b = new Date(maxDate + 'T00:00:00').getTime()
+  const days = Math.floor((b - a) / (1000*60*60*24)) + 1
+  return Math.max(0, days)
+}
+
+/** Adjust these two helpers to match your exact categories */
+function isCOGS(cat?: string | null) {
+  return (cat ?? '').trim().toLowerCase() === 'cogs'
+}
+function isStockIn(cat?: string | null) {
+  const c = (cat ?? '').toLowerCase()
+  return c.includes('stock') || c.includes('inventory')
+}
+
+export default function ComparisonAll() {
   const [email, setEmail] = useState<string | null>(null)
-  const [rangeA, setA] = useState<{ from?: string, to?: string }>({})
-  const [rangeB, setB] = useState<{ from?: string, to?: string }>({})
-  const [rowsA, setRowsA] = useState<Tx[]>([])
-  const [rowsB, setRowsB] = useState<Tx[]>([])
+  const [tx, setTx] = useState<Tx[]>([])
+  const [balances, setBalances] = useState<Balance[]>([])
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    supabase.auth.getUser().then(u => setEmail(u.data.user?.email ?? null))
+    (async () => {
+      const me = await supabase.auth.getUser()
+      setEmail(me.data.user?.email ?? null)
+
+      const [{ data: t, error: te }, { data: b, error: be }] = await Promise.all([
+        supabase.from('transactions').select('*').order('date', { ascending: true }),
+        supabase.from('balances').select('*').order('updated_at', { ascending: true }),
+      ])
+      if (te) { alert('Load failed: ' + te.message); setLoading(false); return }
+      if (be) { alert('Load failed: ' + be.message); setLoading(false); return }
+      setTx((t as Tx[]) || [])
+      setBalances((b as Balance[]) || [])
+      setLoading(false)
+    })()
   }, [])
 
-  async function load(which: 'A' | 'B') {
-    const r = which === 'A' ? rangeA : rangeB
-    let q = supabase.from('transactions').select('*')
-    if (r.from) q = q.gte('date', r.from)
-    if (r.to) q = q.lte('date', r.to)
-    const { data, error } = await q
-    if (error) { alert('Load failed: ' + error.message); return }
-    if (which === 'A') setRowsA((data || []) as Tx[])
-    else setRowsB((data || []) as Tx[])
-  }
+  const {
+    firstDate, lastDate, days,
+    revenue, orders, cogs, stockIn, opex, grossProfit, netProfit,
+    beginning, cashOnHand,
+    avgSalesPerDay, avgGrossProfitPerDay,
+    growthPct, monthlyRows
+  } = useMemo(() => {
+    if (tx.length === 0) {
+      return {
+        firstDate: undefined, lastDate: undefined, days: 0,
+        revenue: 0, orders: 0, cogs: 0, stockIn: 0, opex: 0, grossProfit: 0, netProfit: 0,
+        beginning: 0, cashOnHand: sum(balances.map(b=>b.balance)),
+        avgSalesPerDay: 0, avgGrossProfitPerDay: 0, growthPct: 0, monthlyRows: [] as any[]
+      }
+    }
 
-  const A = useMemo(() => makeKPIs(rowsA, rangeA.from, rangeA.to), [rowsA, rangeA.from, rangeA.to])
-  const B = useMemo(() => makeKPIs(rowsB, rangeB.from, rangeB.to), [rowsB, rangeB.from, rangeB.to])
+    const firstDate = tx[0].date
+    const lastDate  = tx[tx.length-1].date
+    const days = betweenDaysInclusive(firstDate, lastDate) || 1
 
-  const salesGrowthPct = pctDelta(A.revenue, B.revenue)
-  const avgSalesGrowthPct = pctDelta(A.avgSales, B.avgSales)
-  const grossProfitGrowthPct = pctDelta(A.grossProfit, B.grossProfit)
-  const avgGrossProfitGrowthPct = pctDelta(A.avgGrossProfit, B.avgGrossProfit)
-  const netGrowthPct = pctDelta(A.net, B.net)
+    const revenue = sum(tx.filter(r => r.type === 'income').map(r => r.amount))
+    const orders  = tx.filter(r => r.type === 'income').length
+    const cogs    = sum(tx.filter(r => r.type === 'expense' && isCOGS(r.category)).map(r => r.amount))
+    const stockIn = sum(tx.filter(r => r.type === 'expense' && isStockIn(r.category)).map(r => r.amount))
+    const opex    = sum(tx.filter(r => r.type === 'expense' && !isCOGS(r.category)).map(r => r.amount))
+    const grossProfit = revenue - cogs
+    const netProfit   = revenue - (cogs + opex)
 
-  const small = { fontSize: 12, opacity: 0.8 as const }
+    // Beginning = earliest recorded balances sum (fallback 0)
+    const beginning = balances.length
+      ? sum(balances.filter(b => b.updated_at === balances[0].updated_at).map(b => b.balance))
+      : 0
+    // Cash on hand = latest balances sum (if none, 0)
+    const cashOnHand = balances.length
+      ? sum(balances.filter(b => b.updated_at === balances[balances.length-1].updated_at).map(b => b.balance))
+      : 0
+
+    // Averages (per day, matches your screenshot math)
+    const avgSalesPerDay = revenue / days
+    const avgGrossProfitPerDay = grossProfit / days
+
+    // Monthly breakdown
+    const byMonth: Record<string, { sales:number; orders:number; cogs:number; opex:number }> = {}
+    for (const r of tx) {
+      const key = yyyymm(r.date)
+      if (!byMonth[key]) byMonth[key] = { sales:0, orders:0, cogs:0, opex:0 }
+      if (r.type === 'income') {
+        byMonth[key].sales += r.amount
+        byMonth[key].orders += 1
+      } else {
+        if (isCOGS(r.category)) byMonth[key].cogs += r.amount
+        else byMonth[key].opex += r.amount
+      }
+    }
+    const keys = Object.keys(byMonth).sort()
+    const monthlyRows = keys.map(k => {
+      const m = byMonth[k]
+      const gross = m.sales - m.cogs
+      const net   = m.sales - (m.cogs + m.opex)
+      return { month: k, sales: m.sales, orders: m.orders, grossProfit: gross, opex: m.opex, netProfit: net }
+    })
+
+    // Growth = last month revenue vs previous month revenue
+    // (Change this to gross/net by swapping fields below)
+    let growthPct = 0
+    if (monthlyRows.length >= 2) {
+      const last  = monthlyRows[monthlyRows.length-1].sales
+      const prev  = monthlyRows[monthlyRows.length-2].sales
+      growthPct = prev === 0 ? 0 : ((last - prev) / prev) * 100
+    }
+
+    return {
+      firstDate, lastDate, days,
+      revenue, orders, cogs, stockIn, opex, grossProfit, netProfit,
+      beginning, cashOnHand,
+      avgSalesPerDay, avgGrossProfitPerDay,
+      growthPct, monthlyRows
+    }
+  }, [tx, balances])
+
+  if (loading) return null
 
   return (
     <AuthGate>
       <Nav email={email} />
       <div className="container">
         <div className="card">
-          <h2>Pick Two Ranges to Compare</h2>
-          <div className="row">
-            <div style={{ gridColumn: 'span 6' }}>
-              <h3>Range A</h3>
-              <label>From</label>
-              <input className="input" type="date" value={rangeA.from || ''} onChange={e => setA({ ...rangeA, from: e.target.value })} />
-              <label>To</label>
-              <input className="input" type="date" value={rangeA.to || ''} onChange={e => setA({ ...rangeA, to: e.target.value })} />
-              <div style={{ marginTop: 8 }}>
-                <button className="btn" onClick={() => load('A')}>Load A</button>
-              </div>
-            </div>
-            <div style={{ gridColumn: 'span 6' }}>
-              <h3>Range B</h3>
-              <label>From</label>
-              <input className="input" type="date" value={rangeB.from || ''} onChange={e => setB({ ...rangeB, from: e.target.value })} />
-              <label>To</label>
-              <input className="input" type="date" value={rangeB.to || ''} onChange={e => setB({ ...rangeB, to: e.target.value })} />
-              <div style={{ marginTop: 8 }}>
-                <button className="btn" onClick={() => load('B')}>Load B</button>
-              </div>
-            </div>
+          <h2>Business Overview (All Data)</h2>
+          <div className="small">Range: {firstDate ?? '—'} to {lastDate ?? '—'} • Days: {days}</div>
+          <div className="kpi" style={{marginTop:12}}>
+            <div className="card"><h3>BEGINNING</h3><div>{fmt(beginning)}</div></div>
+            <div className="card"><h3>STOCK IN</h3><div>{fmt(stockIn)}</div></div>
+            <div className="card"><h3>RUNNING STOCKS</h3><div>{fmt(beginning + stockIn - cogs)}</div></div>
+            <div className="card"><h3>TOTAL ORDER</h3><div>{orders.toLocaleString()}</div></div>
+            <div className="card"><h3>TOTAL REVENUE</h3><div>{fmt(revenue)}</div></div>
+            <div className="card"><h3>GROSS PROFIT</h3><div>{fmt(grossProfit)}</div></div>
+            <div className="card"><h3>OPEX</h3><div>{fmt(opex)}</div></div>
+            <div className="card"><h3>NET PROFIT</h3><div>{fmt(netProfit)}</div></div>
+            <div className="card"><h3>CASH ON HAND</h3><div>{fmt(cashOnHand)}</div></div>
           </div>
         </div>
 
         <div className="card">
-          <h2>KPIs</h2>
+          <h2>Averages & Growth</h2>
           <div className="kpi">
-            <div className="card">
-              <h3>Average Sales (Daily)</h3>
-              <div>{fmt(A.avgSales)} vs {fmt(B.avgSales)}</div>
-              <div style={small}>Growth: {avgSalesGrowthPct.toFixed(1)}%</div>
-            </div>
-            <div className="card">
-              <h3>Average Gross Profit (Daily)</h3>
-              <div>{fmt(A.avgGrossProfit)} vs {fmt(B.avgGrossProfit)}</div>
-              <div style={small}>Growth: {avgGrossProfitGrowthPct.toFixed(1)}%</div>
-            </div>
-            <div className="card">
-              <h3>Total Sales (Revenue)</h3>
-              <div>{fmt(A.revenue)} vs {fmt(B.revenue)}</div>
-              <div style={small}>Growth: {salesGrowthPct.toFixed(1)}%</div>
-            </div>
-            <div className="card">
-              <h3>Gross Profit</h3>
-              <div>{fmt(A.grossProfit)} vs {fmt(B.grossProfit)}</div>
-              <div style={small}>Growth: {grossProfitGrowthPct.toFixed(1)}%</div>
-            </div>
-            <div className="card">
-              <h3>Net Profit</h3>
-              <div>{fmt(A.net)} vs {fmt(B.net)}</div>
-              <div style={small}>Growth: {netGrowthPct.toFixed(1)}%</div>
-            </div>
+            <div className="card"><h3>AVERAGE SALES</h3><div>{fmt(avgSalesPerDay)}</div></div>
+            <div className="card"><h3>AVERAGE GROSS PROFIT</h3><div>{fmt(avgGrossProfitPerDay)}</div></div>
+            <div className="card"><h3>GROWTH</h3><div>{growthPct.toFixed(0)}%</div></div>
           </div>
+          <div className="small" style={{marginTop:8}}>
+            Average values are per day across the full date range. Growth compares the latest month vs. the previous month (revenue). You can switch this to gross/net inside the file.
+          </div>
+        </div>
+
+        <div className="card">
+          <h2>Monthly Breakdown</h2>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>MONTH</th><th>SALES</th><th>ORDERS</th><th>GROSS PROFIT</th><th>OPEX</th><th>NET PROFIT</th>
+              </tr>
+            </thead>
+            <tbody>
+              {monthlyRows.map(r => (
+                <tr key={r.month}>
+                  <td>{r.month}</td>
+                  <td>{fmt(r.sales)}</td>
+                  <td>{r.orders.toLocaleString()}</td>
+                  <td>{fmt(r.grossProfit)}</td>
+                  <td>{fmt(r.opex)}</td>
+                  <td>{fmt(r.netProfit)}</td>
+                </tr>
+              ))}
+              {monthlyRows.length === 0 && <tr><td colSpan={6} className="small">No transactions yet.</td></tr>}
+            </tbody>
+          </table>
         </div>
       </div>
     </AuthGate>
